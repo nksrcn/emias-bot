@@ -144,22 +144,31 @@ async def restore_session(context, page) -> bool:
     return False
 
 
-async def wait_for_manual_login(http_session) -> list | None:
+async def wait_for_manual_login(http_session, context) -> list | None:
     """
-    Ждёт пока пользователь залогинится через веб-интерфейс.
-    Опрашивает локальный auth_server каждые 5 сек.
+    Ждёт пока пользователь нажмёт 'Я вошёл' на странице авторизации.
+    После этого перехватывает cookies из Playwright context.
     """
-    log.info("Жду ручного логина через веб-интерфейс...")
+    log.info("Жду подтверждения ручного логина...")
     for _ in range(720):  # ждём максимум 1 час
         await asyncio.sleep(5)
         try:
-            async with http_session.get("http://localhost:8080/auth/cookies") as r:
+            async with http_session.get("http://localhost:8080/auth/status") as r:
                 data = await r.json()
-                if data.get("cookies"):
-                    log.info("Получены новые cookies от пользователя")
-                    return data["cookies"]
-        except Exception:
-            pass
+                if data.get("ready"):
+                    log.info("Пользователь подтвердил логин, перехватываю cookies...")
+                    # Открываем ЕМИАС в Playwright и забираем cookies
+                    tmp_page = await context.new_page()
+                    await tmp_page.goto("https://emias.info/app/einfo/", wait_until="networkidle", timeout=30000)
+                    await asyncio.sleep(2)
+                    cookies = await context.cookies()
+                    await tmp_page.close()
+                    if cookies:
+                        save_cookies(cookies)
+                        log.info("Перехвачено %d cookies", len(cookies))
+                        return cookies
+        except Exception as e:
+            log.warning("Ошибка при ожидании логина: %s", e)
     return None
 
 
@@ -264,7 +273,7 @@ async def run():
                 log.warning("Автологин не удался, запрашиваю ручной логин...")
                 await tg(http, "🤖 Бот запущен, но требуется авторизация.")
                 await tg_auth_request(http)
-                new_cookies = await wait_for_manual_login(http)
+                    new_cookies = await wait_for_manual_login(http, context)
                 if new_cookies:
                     save_cookies(new_cookies)
                     await context.add_cookies(new_cookies)
@@ -314,7 +323,7 @@ async def run():
                         else:
                             # Просим пользователя залогиниться
                             await tg_auth_request(http)
-                            new_cookies = await wait_for_manual_login(http)
+                            new_cookies = await wait_for_manual_login(http, context)
                             if new_cookies:
                                 save_cookies(new_cookies)
                                 await context.add_cookies(new_cookies)
