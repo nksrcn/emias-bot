@@ -409,5 +409,26 @@ async def run():
             await asyncio.sleep(get_interval())
 
 
+async def health_server():
+    """Минимальный веб-сервер чтобы Timeweb не перезапускал контейнер."""
+    from aiohttp import web
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="OK"))
+    app.router.add_get("/health", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Health server started on port %d", port)
+
+
+async def main():
+    await asyncio.gather(
+        health_server(),
+        run(),
+    )
+
+
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
