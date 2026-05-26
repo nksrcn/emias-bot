@@ -186,31 +186,65 @@ async def check_and_book(page) -> str:
     if "login" in page.url or "auth" in page.url:
         return "need_relogin"
 
-    await page.goto(EMIAS_URL, wait_until="networkidle", timeout=30000)
-    await asyncio.sleep(2)
-
-    # Ищем карточку направления
-    card = page.locator("text=Эзофагогастродуоденоскопия").first
+    # Увеличенный таймаут + fallback с domcontentloaded
     try:
-        await card.wait_for(state="visible", timeout=10000)
+        await page.goto(EMIAS_URL, wait_until="networkidle", timeout=60000)
     except PlaywrightTimeout:
-        log.warning("Карточка направления не найдена")
+        log.warning("networkidle timeout, пробую domcontentloaded...")
+        try:
+            await page.goto(EMIAS_URL, wait_until="domcontentloaded", timeout=30000)
+        except PlaywrightTimeout:
+            log.error("Страница не загрузилась")
+            return "no_slots"
+    await asyncio.sleep(3)
+
+    # Логируем URL для диагностики
+    log.info("Текущий URL: %s", page.url)
+
+    # Проверяем авторизацию после загрузки
+    if "login" in page.url or "auth" in page.url:
+        return "need_relogin"
+
+    # Angular SPA — ждём пока фреймворк отрисует компоненты
+    # Ждём появления любого контента на странице
+    try:
+        await page.wait_for_selector("button, h1, h2, [class*='card'], [class*='referral'], [class*='direction']", timeout=15000)
+    except PlaywrightTimeout:
+        log.warning("Контент страницы не появился")
+
+    await asyncio.sleep(3)  # дополнительная пауза для Angular
+
+    # Ищем контейнер с нужной процедурой, затем кнопку внутри него
+    # ЕМИАС — Angular SPA, структура: карточка содержит заголовок + кнопку
+    PROCEDURE_TEXT = "Эзофагогастродуоденоскопия, колоноилеоскопия"
+
+    # Пробуем несколько XPath стратегий поиска кнопки внутри нужной карточки
+    xpath_variants = [
+        # Ищем предка кнопки «Записаться», который содержит название процедуры
+        f"//button[contains(text(),'Записаться') and ancestor::*[contains(.,'{PROCEDURE_TEXT}')]]",
+        # Ищем кнопку как следующий сиблинг или потомок блока с названием
+        f"//*[contains(text(),'{PROCEDURE_TEXT}')]/following::button[contains(text(),'Записаться')][1]",
+        f"//*[contains(.,'{PROCEDURE_TEXT}')]//button[contains(text(),'Записаться')]",
+    ]
+
+    book_btn = None
+    for xpath in xpath_variants:
+        try:
+            btn = page.locator(f"xpath={xpath}").first
+            await btn.wait_for(state="visible", timeout=5000)
+            book_btn = btn
+            log.info("Кнопка найдена по xpath: %s", xpath[:60])
+            break
+        except PlaywrightTimeout:
+            continue
+
+    if book_btn is None:
+        page_text = await page.inner_text("body")
+        log.warning("Кнопка для нужной процедуры не найдена. Страница (500 симв.): %s", page_text[:500])
         return "no_slots"
 
-    # Кнопка «Записаться»
-    book_btn = page.locator(
-        "//div[contains(., 'Эзофагогастродуоденоскопия')]//button[contains(text(), 'Записаться')] | "
-        "//li[contains(., 'Эзофагогастродуоденоскопия')]//button[contains(text(), 'Записаться')]"
-    ).first
-    if not await book_btn.is_visible(timeout=2000):
-        book_btn = page.locator("button:has-text('Записаться')").first
-
-    try:
-        await book_btn.wait_for(state="visible", timeout=5000)
-        await book_btn.click()
-        log.info("Нажал 'Записаться'")
-    except PlaywrightTimeout:
-        return "no_slots"
+    await book_btn.click()
+    log.info("Нажал 'Записаться' для Эзофагогастродуоденоскопии")
 
     await asyncio.sleep(3)
 
