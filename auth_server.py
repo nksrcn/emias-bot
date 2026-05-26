@@ -1,9 +1,3 @@
-"""
-Мини веб-сервер на Railway.
-Когда сессия истекает — бот шлёт в Telegram кнопку со ссылкой.
-Вы открываете ссылку, логинитесь в ЕМИАС прямо в браузере через noVNC,
-бот перехватывает cookies и продолжает работу.
-"""
 import asyncio
 import json
 import logging
@@ -12,20 +6,19 @@ from aiohttp import web
 
 log = logging.getLogger(__name__)
 
-# Глобальное хранилище: сюда бот кладёт browser context, сюда же пишет новые cookies
 _state = {
-    "page": None,           # Playwright page для авторизации
-    "cookies_ready": asyncio.Event() if False else None,  # инициализируется в setup()
+    "cookies_ready": None,
     "new_cookies": None,
 }
 
 
-def setup(loop):
-    _state["cookies_ready"] = asyncio.Event()
-
-
 async def handle_login_page(request):
-    """Отдаёт HTML-страницу с iframe на ЕМИАС для ручного логина."""
+    """
+    Страница авторизации.
+    Открывает ЕМИАС в новой вкладке, затем просит пользователя
+    вернуться и нажать кнопку подтверждения.
+    Бот перехватывает cookies через Playwright после подтверждения.
+    """
     html = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -34,82 +27,137 @@ async def handle_login_page(request):
     <title>ЕМИАС — Авторизация бота</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, sans-serif; background: #f0f2f5; }
-        .header {
-            background: #2563eb; color: white;
-            padding: 16px 24px;
-            display: flex; align-items: center; gap: 12px;
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f0f2f5; min-height: 100vh;
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; padding: 20px;
         }
-        .header h1 { font-size: 18px; font-weight: 600; }
-        .header p { font-size: 13px; opacity: 0.85; margin-top: 2px; }
+        .card {
+            background: white; border-radius: 16px;
+            padding: 32px 28px; max-width: 420px; width: 100%;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+        }
+        .logo {
+            font-size: 48px; text-align: center; margin-bottom: 16px;
+        }
+        h1 {
+            font-size: 20px; font-weight: 700; color: #1e293b;
+            text-align: center; margin-bottom: 8px;
+        }
+        .subtitle {
+            font-size: 14px; color: #64748b;
+            text-align: center; margin-bottom: 28px;
+        }
         .steps {
-            background: white; border-bottom: 1px solid #e5e7eb;
-            padding: 12px 24px;
-            display: flex; gap: 24px; align-items: center;
-            font-size: 13px; color: #374151;
+            display: flex; flex-direction: column; gap: 16px;
+            margin-bottom: 28px;
         }
-        .step { display: flex; align-items: center; gap: 6px; }
+        .step {
+            display: flex; align-items: flex-start; gap: 14px;
+        }
         .step-num {
-            width: 22px; height: 22px; border-radius: 50%;
+            width: 32px; height: 32px; border-radius: 50%;
             background: #2563eb; color: white;
             display: flex; align-items: center; justify-content: center;
-            font-size: 11px; font-weight: 700; flex-shrink: 0;
+            font-size: 14px; font-weight: 700; flex-shrink: 0;
         }
-        iframe {
-            width: 100%; border: none;
-            height: calc(100vh - 100px);
-            display: block;
+        .step-num.done { background: #16a34a; }
+        .step-text { padding-top: 6px; font-size: 15px; color: #374151; line-height: 1.4; }
+        .step-text b { color: #1e293b; }
+        .btn {
+            display: block; width: 100%; padding: 14px;
+            border-radius: 10px; border: none; cursor: pointer;
+            font-size: 16px; font-weight: 600; text-align: center;
+            text-decoration: none; transition: opacity 0.2s;
         }
-        #status {
-            position: fixed; bottom: 20px; right: 20px;
-            background: #1e293b; color: white;
-            padding: 10px 18px; border-radius: 8px;
-            font-size: 13px; display: none;
+        .btn:hover { opacity: 0.9; }
+        .btn-primary { background: #2563eb; color: white; margin-bottom: 12px; }
+        .btn-success { background: #16a34a; color: white; display: none; }
+        .btn-success.show { display: block; }
+        .status {
+            margin-top: 16px; padding: 12px 16px;
+            border-radius: 8px; font-size: 14px;
+            text-align: center; display: none;
         }
-        #status.show { display: block; }
-        #status.success { background: #16a34a; }
+        .status.show { display: block; }
+        .status.success { background: #dcfce7; color: #16a34a; }
+        .status.waiting { background: #fef9c3; color: #854d0e; }
+        .divider {
+            border: none; border-top: 1px solid #e5e7eb;
+            margin: 20px 0;
+        }
     </style>
 </head>
 <body>
-    <div class="header">
-        <div>
-            <h1>🤖 Авторизация ЕМИАС-бота</h1>
-            <p>Войдите в ЕМИАС ниже — бот автоматически продолжит работу</p>
+    <div class="card">
+        <div class="logo">🤖</div>
+        <h1>Авторизация ЕМИАС-бота</h1>
+        <p class="subtitle">Выполните 3 простых шага</p>
+
+        <div class="steps">
+            <div class="step">
+                <div class="step-num" id="n1">1</div>
+                <div class="step-text">Нажмите кнопку ниже — откроется <b>ЕМИАС</b> в новой вкладке</div>
+            </div>
+            <div class="step">
+                <div class="step-num" id="n2">2</div>
+                <div class="step-text">Введите логин и пароль, нажмите <b>«Войти»</b></div>
+            </div>
+            <div class="step">
+                <div class="step-num" id="n3">3</div>
+                <div class="step-text">Вернитесь сюда и нажмите <b>«Я вошёл»</b></div>
+            </div>
         </div>
+
+        <a href="https://emias.info/app/einfo/" target="_blank" class="btn btn-primary" id="openBtn"
+           onclick="onOpen()">
+            🔑 Открыть ЕМИАС
+        </a>
+
+        <button class="btn btn-success" id="doneBtn" onclick="onDone()">
+            ✅ Я вошёл в ЕМИАС
+        </button>
+
+        <div class="status waiting" id="status"></div>
     </div>
-    <div class="steps">
-        <div class="step"><div class="step-num">1</div> Введите логин и пароль ЕМИАС</div>
-        <div class="step"><div class="step-num">2</div> Нажмите «Войти»</div>
-        <div class="step"><div class="step-num">3</div> Закройте эту страницу</div>
-    </div>
-    <iframe src="https://emias.info/app/einfo/" id="frame"></iframe>
-    <div id="status"></div>
 
     <script>
-        // Проверяем каждые 3 сек готовность cookies на сервере
-        async function checkReady() {
-            try {
-                const r = await fetch('/auth/status');
-                const d = await r.json();
-                if (d.ready) {
-                    const s = document.getElementById('status');
-                    s.textContent = '✅ Авторизация принята! Бот продолжает работу.';
-                    s.className = 'show success';
-                    setTimeout(() => window.close(), 3000);
-                    return;
-                }
-            } catch(e) {}
-            setTimeout(checkReady, 3000);
+        function onOpen() {
+            setTimeout(() => {
+                document.getElementById('doneBtn').classList.add('show');
+                document.getElementById('n1').classList.add('done');
+                document.getElementById('n1').textContent = '✓';
+            }, 1000);
         }
 
-        // Слушаем сообщения от iframe (postMessage после логина)
-        window.addEventListener('message', async (e) => {
-            if (e.data && e.data.type === 'emias_logged_in') {
-                await fetch('/auth/notify', { method: 'POST' });
-            }
-        });
+        async function onDone() {
+            document.getElementById('doneBtn').disabled = true;
+            document.getElementById('doneBtn').textContent = 'Проверяю...';
+            document.getElementById('n2').classList.add('done');
+            document.getElementById('n2').textContent = '✓';
+            document.getElementById('n3').classList.add('done');
+            document.getElementById('n3').textContent = '✓';
 
-        checkReady();
+            const status = document.getElementById('status');
+
+            try {
+                const r = await fetch('/auth/notify', { method: 'POST' });
+                const d = await r.json();
+                if (d.ok) {
+                    status.textContent = '✅ Отлично! Бот получил авторизацию и продолжает работу. Можете закрыть эту страницу.';
+                    status.className = 'status show success';
+                    document.getElementById('doneBtn').textContent = '✅ Готово!';
+                } else {
+                    throw new Error('not ok');
+                }
+            } catch(e) {
+                status.textContent = '⚠️ Что-то пошло не так. Попробуйте ещё раз.';
+                status.className = 'status show waiting';
+                document.getElementById('doneBtn').disabled = false;
+                document.getElementById('doneBtn').textContent = '✅ Я вошёл в ЕМИАС';
+            }
+        }
     </script>
 </body>
 </html>"""
@@ -117,19 +165,18 @@ async def handle_login_page(request):
 
 
 async def handle_notify(request):
-    """iframe сообщает что логин прошёл."""
-    _state["cookies_ready"].set()
+    """Пользователь подтвердил что залогинился — сигналим боту."""
+    if _state["cookies_ready"]:
+        _state["cookies_ready"].set()
     return web.json_response({"ok": True})
 
 
 async def handle_status(request):
-    """Бот проверяет — готовы ли cookies."""
-    ready = _state["cookies_ready"].is_set()
+    ready = _state["cookies_ready"] and _state["cookies_ready"].is_set()
     return web.json_response({"ready": ready})
 
 
 async def handle_cookies(request):
-    """Бот забирает новые cookies после логина."""
     cookies = _state.get("new_cookies")
     if cookies:
         _state["cookies_ready"].clear()
@@ -139,10 +186,10 @@ async def handle_cookies(request):
 
 
 async def handle_set_cookies(request):
-    """Бот кладёт свежие cookies (вызывается после перехвата из браузера)."""
     data = await request.json()
     _state["new_cookies"] = data.get("cookies")
-    _state["cookies_ready"].set()
+    if _state["cookies_ready"]:
+        _state["cookies_ready"].set()
     return web.json_response({"ok": True})
 
 
@@ -158,6 +205,7 @@ def create_app():
 
 
 async def start_server(port: int = int(os.getenv("PORT", "8080"))):
+    _state["cookies_ready"] = asyncio.Event()
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
