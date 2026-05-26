@@ -68,41 +68,8 @@ def emias_headers() -> dict:
 
 
 async def refresh_session(session) -> bool:
-    """
-    Обновляет сессию через refreshToken → accessToken → whoAmI.
-    Возвращает True если успешно.
-    """
-    log.info("Обновляю токен через refreshToken...")
-
-    # Шаг 1: обновляем accessToken через refreshToken
-    try:
-        async with session.post(
-            "https://login.mos.ru/sps/oauth/ae",
-            json={
-                "grant_type": "refresh_token",
-                "refresh_token": _tokens["refresh_token"],
-                "client_id": "emias.info.web",
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                log.warning("refresh_token → %d: %s", r.status, body[:150])
-                # Пробуем альтернативный endpoint
-            else:
-                data = await r.json()
-                new_access = data.get("access_token")
-                new_refresh = data.get("refresh_token")
-                if new_access:
-                    _tokens["access_token"] = new_access
-                    log.info("accessToken обновлён")
-                if new_refresh:
-                    _tokens["refresh_token"] = new_refresh
-    except Exception as e:
-        log.warning("Ошибка обновления через login.mos.ru: %s", e)
-
-    # Шаг 2: вызываем whoAmI для обновления сессии ЕМИАС
+    """Обновляет сессию через whoAmI."""
+    log.info("Обновляю сессию через whoAmI...")
     try:
         async with session.post(
             "https://emias.info/web-api/whoAmI/",
@@ -116,29 +83,17 @@ async def refresh_session(session) -> bool:
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
             if r.status == 200:
-                # Обновляем cookie из ответа
+                # Обновляем cookie из Set-Cookie заголовков
                 new_cookies = r.cookies
                 if new_cookies:
-                    cookie_str = "; ".join(
-                        f"{k}={v.value}" for k, v in new_cookies.items()
-                    )
+                    cookie_str = "; ".join(f"{k}={v.value}" for k, v in new_cookies.items())
                     if cookie_str:
                         _tokens["cookie"] = cookie_str + "; " + _tokens["cookie"]
-                        log.info("Cookie обновлены из whoAmI")
-
-                # Обновляем Ei-Token если вернулся
-                data = await r.json()
-                new_ei = data.get("eiToken") or data.get("ei_token")
-                if new_ei:
-                    _tokens["ei_token"] = new_ei
-                    log.info("Ei-Token обновлён")
-
-                log.info("whoAmI успешно — сессия обновлена")
+                log.info("whoAmI OK — сессия обновлена")
                 return True
-            else:
-                body = await r.text()
-                log.warning("whoAmI → %d: %s", r.status, body[:150])
-                return False
+            body = await r.text()
+            log.warning("whoAmI → %d: %s", r.status, body[:150])
+            return False
     except Exception as e:
         log.error("whoAmI ошибка: %s", e)
         return False
