@@ -1,0 +1,11 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+restartPolicyType = "always"
+
+[[services]]
+name = "emias-bot"
+
+[services.variables]
+PORT = "8080"
