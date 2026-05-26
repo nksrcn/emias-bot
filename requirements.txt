@@ -1,2 +1,5 @@
-aiohttp==3.9.5
-playwright==1.44.0
+[build]
+builder = "dockerfile"
+
+[deploy]
+restartPolicyType = "always"
