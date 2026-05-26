@@ -1,28 +1,27 @@
 import asyncio
-import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
 import aiohttp
 
 # ── Настройки (переменные окружения Timeweb) ──────────────────────────────────
-OMS_NUMBER = os.environ["OMS_NUMBER"]    # номер полиса
-BIRTH_DATE = os.environ["BIRTH_DATE"]   # дата рождения: 1970-08-15
-EI_TOKEN   = os.environ["EI_TOKEN"]     # токен из браузера (Ei-Token)
+OMS_NUMBER = os.environ["OMS_NUMBER"]    # 7700007070150870
+BIRTH_DATE = os.environ["BIRTH_DATE"]   # 1970-08-15
+EI_TOKEN   = os.environ["EI_TOKEN"]     # токен из браузера
 COOKIE     = os.environ["EMIAS_COOKIE"] # cookie из браузера
-TG_TOKEN   = os.environ["TG_TOKEN"]     # токен Telegram бота
-TG_CHAT_ID = os.environ["TG_CHAT_ID"]  # ваш Telegram chat_id
+TG_TOKEN   = os.environ["TG_TOKEN"]
+TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 
-# ── Данные направления (из API ЕМИАС) ─────────────────────────────────────────
-REFERRAL_ID = 172751854717   # ID направления
-LPU_ID      = 10492228       # МНЦ ГКБ им. С.П. Боткина
-LDP_TYPE_ID = 1267932267     # Эзофагогастродуоденоскопия, колоноилеоскопия
+# ── Данные направления (МНЦ ГКБ им. С.П. Боткина) ────────────────────────────
+# Эти значения нужно обновить когда появятся талоны и мы увидим реальный
+# getAvailableResourceScheduleInfo для нашего направления
+REFERRAL_ID = int(os.getenv("REFERRAL_ID", "172751854717"))
 
 # ── Интервалы проверки ────────────────────────────────────────────────────────
-CHECK_NORMAL = int(os.getenv("CHECK_INTERVAL_NORMAL", "300"))  # обычно: 5 мин
-CHECK_ACTIVE = int(os.getenv("CHECK_INTERVAL_ACTIVE", "5"))    # активно: 5 сек
-ACTIVE_START = (7, 25)
-ACTIVE_END   = (7, 45)
+CHECK_NORMAL = int(os.getenv("CHECK_INTERVAL_NORMAL", "300"))  # 5 мин
+CHECK_ACTIVE = int(os.getenv("CHECK_INTERVAL_ACTIVE", "1"))    # 1 сек
+ACTIVE_START = (7, 28)
+ACTIVE_END   = (7, 35)
 
 MSK = timezone(timedelta(hours=3))
 API = "https://emias.info/api-eip/v4/saOrchestrator"
@@ -58,10 +57,8 @@ def emias_headers() -> dict:
     }
 
 
-async def tg(session, text: str, buttons=None):
+async def tg(session, text: str):
     payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-    if buttons:
-        payload["reply_markup"] = {"inline_keyboard": buttons}
     for mirror in TG_MIRRORS:
         try:
             async with session.post(
@@ -76,83 +73,169 @@ async def tg(session, text: str, buttons=None):
     log.error("Telegram недоступен")
 
 
-async def get_slots(session):
-    """Проверяет доступные талоны. Возвращает список слотов | 'unauthorized' | []"""
-    payload = {
-        "referralId": REFERRAL_ID,
-        "lpuId": LPU_ID,
-        "ldpTypeId": LDP_TYPE_ID,
-        "omsNumber": OMS_NUMBER,
-        "birthDate": BIRTH_DATE,
-    }
-    endpoints = [
-        f"{API}/getAvailableScheduleByReferral",
-        f"{API}/getLdpSchedule",
-        "https://emias.info/api-eip/v1/ldp/schedule/getAvailableSchedule",
-    ]
-    for url in endpoints:
-        try:
-            async with session.post(
-                url, headers=emias_headers(), json=payload,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                if r.status == 401:
-                    return "unauthorized"
-                if r.status in (404, 405):
-                    continue
-                if r.status != 200:
-                    body = await r.text()
-                    log.warning("%s → %d: %s", url.split("/")[-1], r.status, body[:150])
-                    continue
-                data = await r.json()
-                log.info("Рабочий endpoint: %s", url.split("/")[-1])
-                p = data.get("payload") or {}
-                slots = (
-                    p.get("scheduleByDays") or
-                    p.get("slots") or
-                    p.get("schedule") or
-                    (p if isinstance(p, list) else [])
-                )
-                return slots
-        except Exception as e:
-            log.warning("%s → %s", url.split("/")[-1], e)
-    return []
+async def get_referral_info(session) -> dict | str:
+    """
+    Шаг 1: Получаем список направлений.
+    Возвращает данные нашего направления или 'unauthorized'.
+    """
+    try:
+        async with session.post(
+            f"{API}/getAssignmentsReferralsInfo",
+            headers=emias_headers(),
+            json={"omsNumber": OMS_NUMBER, "birthDate": BIRTH_DATE},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 401:
+                return "unauthorized"
+            if r.status != 200:
+                log.warning("getAssignmentsReferralsInfo → %d", r.status)
+                return {}
+            data = await r.json()
+            referrals = (
+                data.get("payload", {})
+                .get("arInfo", {})
+                .get("referrals", {})
+                .get("items", [])
+            )
+            # Ищем наше направление по ID
+            for ref in referrals:
+                if ref.get("id") == REFERRAL_ID:
+                    return ref
+            return {}
+    except Exception as e:
+        log.error("get_referral_info: %s", e)
+        return {}
 
 
-async def book_slot(session, slot: dict) -> bool:
-    """Записывается на первый доступный слот."""
-    times = slot.get("scheduleItems") or []
-    if not times:
-        return False
-    first = times[0]
-    payload = {
-        "referralId": REFERRAL_ID,
-        "lpuId": LPU_ID,
-        "ldpTypeId": LDP_TYPE_ID,
-        "omsNumber": OMS_NUMBER,
-        "birthDate": BIRTH_DATE,
-        "scheduleItemId": first.get("scheduleItemId"),
-        "appointmentDate": slot.get("date"),
-        "appointmentTime": first.get("time"),
-    }
-    endpoints = [
-        f"{API}/createLdpAppointment",
-        "https://emias.info/api-eip/v1/ldp/schedule/createLdpAppointment",
-    ]
-    for url in endpoints:
-        try:
-            async with session.post(
-                url, headers=emias_headers(), json=payload,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                if r.status == 200:
-                    log.info("Запись успешна")
-                    return True
+async def get_slots(session, referral: dict) -> list | str:
+    """
+    Шаг 2: Получаем доступные слоты для направления.
+    Возвращает список слотов или 'unauthorized'.
+    """
+    try:
+        async with session.post(
+            f"{API}/getAvailableResourceScheduleInfo",
+            headers=emias_headers(),
+            json={
+                "omsNumber": OMS_NUMBER,
+                "birthDate": BIRTH_DATE,
+                "referralId": REFERRAL_ID,
+                # availableResourceId и complexResourceId приходят
+                # в ответе getAssignmentsReferralsInfo когда есть талоны
+                "availableResourceId": referral.get("availableResourceId"),
+                "complexResourceId": referral.get("complexResourceId"),
+            },
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 401:
+                return "unauthorized"
+            if r.status != 200:
                 body = await r.text()
-                log.error("%s → %d: %s", url.split("/")[-1], r.status, body[:200])
-        except Exception as e:
-            log.error("book_slot %s: %s", url.split("/")[-1], e)
-    return False
+                log.warning("getAvailableResourceScheduleInfo → %d: %s", r.status, body[:150])
+                return []
+            data = await r.json()
+            p = data.get("payload") or {}
+            # Ищем слоты в ответе
+            slots = (
+                p.get("scheduleByDays") or
+                p.get("slots") or
+                p.get("schedule") or
+                p.get("availableDays") or
+                []
+            )
+            log.info("Слотов найдено: %d", len(slots))
+            return slots
+    except Exception as e:
+        log.error("get_slots: %s", e)
+        return []
+
+
+async def check_available(session) -> list | str:
+    """
+    Проверяет наличие талонов через getAssignmentsReferralsInfo.
+    Талоны есть если в направлении появились availableResourceId/complexResourceId.
+    """
+    try:
+        async with session.post(
+            f"{API}/getAssignmentsReferralsInfo",
+            headers=emias_headers(),
+            json={"omsNumber": OMS_NUMBER, "birthDate": BIRTH_DATE},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 401:
+                return "unauthorized"
+            if r.status != 200:
+                log.warning("check_available → %d", r.status)
+                return []
+            data = await r.json()
+            referrals = (
+                data.get("payload", {})
+                .get("arInfo", {})
+                .get("referrals", {})
+                .get("items", [])
+            )
+            for ref in referrals:
+                if ref.get("id") == REFERRAL_ID:
+                    # Талоны есть если появились эти поля
+                    if ref.get("availableResourceId") or ref.get("countActiveAppointment", 0) > 0:
+                        log.info("Найдены данные для записи: %s", ref)
+                        return ref
+                    # Логируем текущее состояние для диагностики
+                    log.info("Направление найдено, талонов нет. countActive=%d",
+                             ref.get("countActiveAppointment", 0))
+                    return []
+            log.warning("Направление %d не найдено в списке", REFERRAL_ID)
+            return []
+    except Exception as e:
+        log.error("check_available: %s", e)
+        return []
+
+
+async def book_slot(session, referral: dict, slot: dict) -> bool:
+    """
+    Шаг 3: Записываемся на первый доступный слот.
+    """
+    # Берём первое время из слота
+    times = (
+        slot.get("scheduleItems") or
+        slot.get("slots") or
+        slot.get("times") or
+        []
+    )
+    if not times:
+        log.error("Нет времён в слоте: %s", slot)
+        return False
+
+    first = times[0]
+    start_time = first.get("startTime") or first.get("time") or first.get("start")
+    end_time   = first.get("endTime")   or first.get("end")
+
+    log.info("Записываюсь: startTime=%s endTime=%s", start_time, end_time)
+
+    try:
+        async with session.post(
+            f"{API}/createAppointment",
+            headers=emias_headers(),
+            json={
+                "omsNumber": OMS_NUMBER,
+                "birthDate": BIRTH_DATE,
+                "referralId": REFERRAL_ID,
+                "availableResourceId": referral.get("availableResourceId"),
+                "complexResourceId": referral.get("complexResourceId"),
+                "startTime": start_time,
+                "endTime": end_time,
+            },
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            body = await r.text()
+            if r.status == 200:
+                log.info("Запись успешна: %s", body[:200])
+                return True
+            log.error("createAppointment → %d: %s", r.status, body[:200])
+            return False
+    except Exception as e:
+        log.error("book_slot: %s", e)
+        return False
 
 
 async def run():
@@ -160,12 +243,12 @@ async def run():
 
         # Проверка авторизации при старте
         log.info("Проверяю авторизацию...")
-        test = await get_slots(session)
+        test = await check_available(session)
         if test == "unauthorized":
             await tg(session,
                 "❌ <b>Ошибка авторизации</b>\n\n"
                 "Проверьте <code>EI_TOKEN</code> и <code>EMIAS_COOKIE</code> в Timeweb.\n"
-                "Возьмите свежие значения: F12 → Network → запрос к emias.info → Headers."
+                "F12 → Network → запрос к emias.info → Headers."
             )
             return
 
@@ -174,7 +257,7 @@ async def run():
             "🤖 <b>Бот запущен и авторизован</b>\n\n"
             "Мониторю: Эзофагогастродуоденоскопия, колоноилеоскопия (скрининг)\n"
             "🏥 МНЦ ГКБ им. С.П. Боткина\n\n"
-            f"🔴 Активный режим 07:25–07:45 МСК — каждые {CHECK_ACTIVE} сек\n"
+            f"🔴 Активный режим 07:28–07:35 МСК — каждую секунду\n"
             f"🟢 Обычный режим — каждые {CHECK_NORMAL // 60} мин"
         )
 
@@ -188,14 +271,14 @@ async def run():
 
                 if mode != last_mode:
                     if mode == "active":
-                        await tg(session, f"🔴 <b>Активный режим</b> [{msk_now} МСК] — каждые {interval} сек")
+                        await tg(session, f"🔴 <b>Активный режим</b> [{msk_now} МСК] — каждую секунду")
                     else:
                         await tg(session, f"🟢 Обычный режим [{msk_now} МСК] — каждые {interval // 60} мин")
                     last_mode = mode
 
-                slots = await get_slots(session)
+                result = await check_available(session)
 
-                if slots == "unauthorized":
+                if result == "unauthorized":
                     await tg(session,
                         "🔐 <b>Токен истёк — нужно обновить</b>\n\n"
                         "1. Зайдите в ЕМИАС в браузере\n"
@@ -207,26 +290,35 @@ async def run():
                     await asyncio.sleep(1800)
                     continue
 
-                if slots:
-                    first = slots[0]
-                    date = first.get("date", "?")
-                    times = first.get("scheduleItems", [])
-                    time = times[0].get("time", "?") if times else "?"
-                    log.info("Талоны найдены! %s %s", date, time)
-                    await tg(session, f"🎉 <b>Талоны появились!</b> Записываюсь на {date} в {time}...")
+                if result and isinstance(result, dict):
+                    # Талоны появились — получаем расписание
+                    log.info("Талоны появились! Получаю расписание...")
+                    slots = await get_slots(session, result)
 
-                    if await book_slot(session, first):
-                        await tg(session,
-                            f"✅ <b>Записано!</b>\n\n"
-                            f"📋 Эзофагогастродуоденоскопия, колоноилеоскопия (скрининг)\n"
-                            f"📅 {date} в {time}\n"
-                            f"🏥 МНЦ ГКБ им. С.П. Боткина"
-                        )
-                        break
+                    if slots and isinstance(slots, list) and len(slots) > 0:
+                        first_slot = slots[0]
+                        date = first_slot.get("date", "?")
+                        times = (first_slot.get("scheduleItems") or
+                                 first_slot.get("slots") or [])
+                        time = times[0].get("startTime", "?") if times else "?"
+
+                        log.info("Записываюсь на %s %s", date, time)
+                        await tg(session, f"🎉 <b>Талоны появились!</b> Записываюсь на {date} в {time}...")
+
+                        if await book_slot(session, result, first_slot):
+                            await tg(session,
+                                f"✅ <b>Записано!</b>\n\n"
+                                f"📋 Эзофагогастродуоденоскопия, колоноилеоскопия (скрининг)\n"
+                                f"📅 {date} в {time}\n"
+                                f"🏥 МНЦ ГКБ им. С.П. Боткина"
+                            )
+                            log.info("Запись успешна! Останавливаю бота.")
+                            break
+                        else:
+                            await tg(session, "⚠️ Не удалось записаться, попробую снова...")
                     else:
-                        await tg(session, "⚠️ Не удалось записаться, попробую снова через минуту...")
-                        await asyncio.sleep(60)
-                        continue
+                        log.warning("Слоты не получены, данные: %s", result)
+
                 else:
                     log.info("[%s] Талонов нет", datetime.now(MSK).strftime("%H:%M:%S"))
 
