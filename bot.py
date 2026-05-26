@@ -42,17 +42,26 @@ def get_interval() -> int:
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
+# Список API-эндпоинтов: основной + зеркало на случай блокировки в РФ
+TG_API_ENDPOINTS = [
+    "https://api.telegram.org",
+    "https://tg.i-c-a.su",
+]
+
 async def tg(session, text: str, buttons=None):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
-    try:
-        async with session.post(url, json=payload) as r:
-            if r.status != 200:
-                log.error("Telegram error: %s", await r.text())
-    except Exception as e:
-        log.error("Telegram failed: %s", e)
+    for base in TG_API_ENDPOINTS:
+        url = f"{base}/bot{TG_TOKEN}/sendMessage"
+        try:
+            async with session.post(url, json=payload, timeout=10) as r:
+                if r.status == 200:
+                    return
+                log.warning("Telegram %s вернул %d", base, r.status)
+        except Exception as e:
+            log.warning("Telegram %s недоступен: %s", base, e)
+    log.error("Все Telegram эндпоинты недоступны")
 
 
 async def tg_auth_request(session):
