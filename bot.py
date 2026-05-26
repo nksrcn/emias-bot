@@ -83,9 +83,11 @@ async def tg(session, text: str):
 async def refresh_session(session) -> bool:
     """
     Обновляет сессию через whoAmI.
-    whoAmI принимает accessToken и обновляет session-cookie на сервере.
-    Возвращает True если успешно.
+    accessToken == Ei-Token — одно и то же значение.
+    whoAmI возвращает новый accessToken который используем как новый Ei-Token.
     """
+    import re
+    log.info("Обновляю сессию через whoAmI (accessToken=%s...)", _tokens["access_token"][:20])
     try:
         async with session.post(
             "https://emias.info/web-api/whoAmI/",
@@ -100,23 +102,37 @@ async def refresh_session(session) -> bool:
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
             if r.status == 200:
-                # Обновляем session-cookie если сервер прислал новый
+                # Обновляем session-cookie
                 new_cookies = r.cookies
                 if new_cookies:
-                    cookie_parts = [f"{k}={v.value}" for k, v in new_cookies.items()]
-                    # Заменяем session-cookie в строке
                     existing = _tokens["cookie"]
-                    for part in cookie_parts:
-                        key = part.split("=")[0]
-                        # Заменяем если уже есть, иначе добавляем
-                        if key in existing:
-                            import re
-                            existing = re.sub(rf"{key}=[^;]*", part, existing)
+                    for k, v in new_cookies.items():
+                        part = f"{k}={v.value}"
+                        if k in existing:
+                            existing = re.sub(rf"{k}=[^;]*", part, existing)
                         else:
                             existing = part + "; " + existing
                     _tokens["cookie"] = existing
+
+                # Самое важное: whoAmI возвращает новый accessToken
+                # который одновременно является новым Ei-Token
+                data = await r.json()
+                new_token = (
+                    data.get("accessToken") or
+                    data.get("access_token") or
+                    data.get("eiToken") or
+                    data.get("token")
+                )
+                if new_token:
+                    _tokens["access_token"] = new_token
+                    _tokens["ei_token"] = new_token
+                    log.info("Токен обновлён: %s...", new_token[:20])
+                else:
+                    log.info("whoAmI не вернул новый токен, используем текущий")
+
                 log.info("whoAmI OK — сессия обновлена")
                 return True
+
             body = await r.text()
             log.warning("whoAmI → %d: %s", r.status, body[:200])
             return False
