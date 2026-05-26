@@ -273,7 +273,7 @@ async def run():
                 log.warning("Автологин не удался, запрашиваю ручной логин...")
                 await tg(http, "🤖 Бот запущен, но требуется авторизация.")
                 await tg_auth_request(http)
-                    new_cookies = await wait_for_manual_login(http, context)
+                new_cookies = await wait_for_manual_login(http, context)
                 if new_cookies:
                     save_cookies(new_cookies)
                     await context.add_cookies(new_cookies)
