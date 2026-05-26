@@ -17,9 +17,12 @@ CHECK_INTERVAL_ACTIVE = int(os.getenv("CHECK_INTERVAL_ACTIVE", "5"))    # 5 се
 ACTIVE_START = (7, 25)
 ACTIVE_END   = (7, 45)
 
-EMIAS_URL  = "https://emias.info/app/einfo/#/referrals"
+EMIAS_URL    = "https://emias.info/app/einfo/#/referrals"
 COOKIES_FILE = "/tmp/emias_cookies.json"
 MSK = timezone(timedelta(hours=3))
+
+# Cookies могут храниться в переменной окружения (надёжнее чем /tmp)
+COOKIES_ENV = os.getenv("EMIAS_COOKIES", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,15 +80,30 @@ async def tg_auth_request(session):
 
 # ── Cookies ───────────────────────────────────────────────────────────────────
 def save_cookies(cookies: list):
-    with open(COOKIES_FILE, "w") as f:
-        json.dump(cookies, f)
+    # Сохраняем в файл
+    try:
+        with open(COOKIES_FILE, "w") as f:
+            json.dump(cookies, f)
+    except Exception as e:
+        log.warning("Не удалось сохранить cookies в файл: %s", e)
     log.info("Cookies сохранены (%d шт.)", len(cookies))
 
 
 def load_cookies() -> list | None:
+    # Сначала пробуем из переменной окружения (надёжнее)
+    if COOKIES_ENV:
+        try:
+            cookies = json.loads(COOKIES_ENV)
+            log.info("Cookies загружены из переменной окружения (%d шт.)", len(cookies))
+            return cookies
+        except Exception as e:
+            log.warning("Ошибка парсинга EMIAS_COOKIES: %s", e)
+    # Затем из файла
     try:
         with open(COOKIES_FILE) as f:
-            return json.load(f)
+            cookies = json.load(f)
+            log.info("Cookies загружены из файла (%d шт.)", len(cookies))
+            return cookies
     except Exception:
         return None
 
@@ -325,11 +343,23 @@ async def run():
                     await tg(http, "❌ Авторизация не получена за 1 час. Перезапустите бота.")
                     return
 
-            await tg(http, (
-                "🤖 <b>Бот запущен и авторизован</b>\n\n"
-                f"🔴 Активный режим 07:25–07:45 МСК — каждые {CHECK_INTERVAL_ACTIVE} сек\n"
-                f"🟢 Обычный режим — каждые {CHECK_INTERVAL_NORMAL // 60} мин"
-            ))
+            # Отправляем cookies в Telegram для сохранения в EMIAS_COOKIES
+            saved = load_cookies()
+            if saved and not COOKIES_ENV:
+                cookies_str = json.dumps(saved)
+                await tg(http,
+                    "🤖 <b>Бот запущен и авторизован</b>\n\n"
+                    f"🔴 Активный режим 07:25–07:45 МСК — каждые {CHECK_INTERVAL_ACTIVE} сек\n"
+                    f"🟢 Обычный режим — каждые {CHECK_INTERVAL_NORMAL // 60} мин\n\n"
+                    "💾 <b>Сохраните cookies</b> — добавьте переменную <code>EMIAS_COOKIES</code> в Timeweb:"
+                )
+                await tg(http, f"<code>{cookies_str}</code>")
+            else:
+                await tg(http, (
+                    "🤖 <b>Бот запущен и авторизован</b>\n\n"
+                    f"🔴 Активный режим 07:25–07:45 МСК — каждые {CHECK_INTERVAL_ACTIVE} сек\n"
+                    f"🟢 Обычный режим — каждые {CHECK_INTERVAL_NORMAL // 60} мин"
+                ))
 
             last_mode = None
 
