@@ -3,26 +3,30 @@ import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+import aiohttp
 
-# ── Настройки ─────────────────────────────────────────────────────────────────
-EMIAS_LOGIN    = os.environ["EMIAS_LOGIN"]
-EMIAS_PASSWORD = os.environ["EMIAS_PASSWORD"]
-TG_TOKEN       = os.environ["TG_TOKEN"]
-TG_CHAT_ID     = os.environ["TG_CHAT_ID"]
-RAILWAY_URL    = os.environ["RAILWAY_PUBLIC_DOMAIN"]  # автоматически задаётся Railway
+# ── Настройки (переменные окружения Timeweb) ──────────────────────────────────
+OMS_NUMBER = os.environ["OMS_NUMBER"]    # номер полиса
+BIRTH_DATE = os.environ["BIRTH_DATE"]   # дата рождения: 1970-08-15
+EI_TOKEN   = os.environ["EI_TOKEN"]     # токен из браузера (Ei-Token)
+COOKIE     = os.environ["EMIAS_COOKIE"] # cookie из браузера
+TG_TOKEN   = os.environ["TG_TOKEN"]     # токен Telegram бота
+TG_CHAT_ID = os.environ["TG_CHAT_ID"]  # ваш Telegram chat_id
 
-CHECK_INTERVAL_NORMAL = int(os.getenv("CHECK_INTERVAL_NORMAL", "300"))  # 5 минут
-CHECK_INTERVAL_ACTIVE = int(os.getenv("CHECK_INTERVAL_ACTIVE", "5"))    # 5 секунд
+# ── Данные направления (из API ЕМИАС) ─────────────────────────────────────────
+REFERRAL_ID = 172751854717   # ID направления
+LPU_ID      = 10492228       # МНЦ ГКБ им. С.П. Боткина
+LDP_TYPE_ID = 1267932267     # Эзофагогастродуоденоскопия, колоноилеоскопия
+
+# ── Интервалы проверки ────────────────────────────────────────────────────────
+CHECK_NORMAL = int(os.getenv("CHECK_INTERVAL_NORMAL", "300"))  # обычно: 5 мин
+CHECK_ACTIVE = int(os.getenv("CHECK_INTERVAL_ACTIVE", "5"))    # активно: 5 сек
 ACTIVE_START = (7, 25)
 ACTIVE_END   = (7, 45)
 
-EMIAS_URL    = "https://emias.info/app/einfo/#/referrals"
-COOKIES_FILE = "/tmp/emias_cookies.json"
 MSK = timezone(timedelta(hours=3))
-
-# Cookies могут храниться в переменной окружения (надёжнее чем /tmp)
-COOKIES_ENV = os.getenv("EMIAS_COOKIES", "")
+API = "https://emias.info/api-eip/v4/saOrchestrator"
+TG_MIRRORS = ["https://api.telegram.org", "https://tg.i-c-a.su"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +36,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Интервал проверки ─────────────────────────────────────────────────────────
 def get_interval() -> int:
     msk = datetime.now(MSK)
     h, m = msk.hour, msk.minute
@@ -41,376 +44,198 @@ def get_interval() -> int:
         (h == ACTIVE_END[0]   and m <= ACTIVE_END[1])   or
         (ACTIVE_START[0] < h < ACTIVE_END[0])
     )
-    return CHECK_INTERVAL_ACTIVE if active else CHECK_INTERVAL_NORMAL
+    return CHECK_ACTIVE if active else CHECK_NORMAL
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-# Список API-эндпоинтов: основной + зеркало на случай блокировки в РФ
-TG_API_ENDPOINTS = [
-    "https://api.telegram.org",
-    "https://tg.i-c-a.su",
-]
+def emias_headers() -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Cookie": COOKIE,
+        "Ei-Token": EI_TOKEN,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Referer": "https://emias.info/app/einfo/",
+        "Origin": "https://emias.info",
+    }
+
 
 async def tg(session, text: str, buttons=None):
     payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
-    for base in TG_API_ENDPOINTS:
-        url = f"{base}/bot{TG_TOKEN}/sendMessage"
+    for mirror in TG_MIRRORS:
         try:
-            async with session.post(url, json=payload, timeout=10) as r:
+            async with session.post(
+                f"{mirror}/bot{TG_TOKEN}/sendMessage",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
                 if r.status == 200:
                     return
-                log.warning("Telegram %s вернул %d", base, r.status)
         except Exception as e:
-            log.warning("Telegram %s недоступен: %s", base, e)
-    log.error("Все Telegram эндпоинты недоступны")
+            log.warning("Telegram %s: %s", mirror, e)
+    log.error("Telegram недоступен")
 
 
-async def tg_auth_request(session):
-    """Шлёт в Telegram кнопку для авторизации."""
-    login_url = f"https://{RAILWAY_URL}/auth/login"
-    await tg(session,
-        "🔐 <b>Нужна авторизация в ЕМИАС</b>\n\n"
-        "Нажмите кнопку ниже, войдите в ЕМИАС.\n"
-        "Бот автоматически продолжит работу после входа.",
-        buttons=[[{"text": "🔑 Войти в ЕМИАС", "url": login_url}]]
-    )
-
-
-# ── Cookies ───────────────────────────────────────────────────────────────────
-def save_cookies(cookies: list):
-    # Сохраняем в файл
-    try:
-        with open(COOKIES_FILE, "w") as f:
-            json.dump(cookies, f)
-    except Exception as e:
-        log.warning("Не удалось сохранить cookies в файл: %s", e)
-    log.info("Cookies сохранены (%d шт.)", len(cookies))
-
-
-def load_cookies() -> list | None:
-    # Сначала пробуем из переменной окружения (надёжнее)
-    if COOKIES_ENV:
+async def get_slots(session):
+    """Проверяет доступные талоны. Возвращает список слотов | 'unauthorized' | []"""
+    payload = {
+        "referralId": REFERRAL_ID,
+        "lpuId": LPU_ID,
+        "ldpTypeId": LDP_TYPE_ID,
+        "omsNumber": OMS_NUMBER,
+        "birthDate": BIRTH_DATE,
+    }
+    endpoints = [
+        f"{API}/getAvailableScheduleByReferral",
+        f"{API}/getLdpSchedule",
+        "https://emias.info/api-eip/v1/ldp/schedule/getAvailableSchedule",
+    ]
+    for url in endpoints:
         try:
-            cookies = json.loads(COOKIES_ENV)
-            log.info("Cookies загружены из переменной окружения (%d шт.)", len(cookies))
-            return cookies
+            async with session.post(
+                url, headers=emias_headers(), json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 401:
+                    return "unauthorized"
+                if r.status in (404, 405):
+                    continue
+                if r.status != 200:
+                    body = await r.text()
+                    log.warning("%s → %d: %s", url.split("/")[-1], r.status, body[:150])
+                    continue
+                data = await r.json()
+                log.info("Рабочий endpoint: %s", url.split("/")[-1])
+                p = data.get("payload") or {}
+                slots = (
+                    p.get("scheduleByDays") or
+                    p.get("slots") or
+                    p.get("schedule") or
+                    (p if isinstance(p, list) else [])
+                )
+                return slots
         except Exception as e:
-            log.warning("Ошибка парсинга EMIAS_COOKIES: %s", e)
-    # Затем из файла
-    try:
-        with open(COOKIES_FILE) as f:
-            cookies = json.load(f)
-            log.info("Cookies загружены из файла (%d шт.)", len(cookies))
-            return cookies
-    except Exception:
-        return None
+            log.warning("%s → %s", url.split("/")[-1], e)
+    return []
 
 
-# ── Авторизация ───────────────────────────────────────────────────────────────
-async def try_login_with_password(page) -> bool:
-    """Пробует войти логин+пароль автоматически."""
-    try:
-        await page.goto("https://emias.info/app/einfo/", wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
-
-        # Переключаемся на логин/пароль если нужно
-        for selector in ["text=Войти с логином и паролем", "text=Логин и пароль", "text=Другой способ"]:
-            try:
-                btn = page.locator(selector).first
-                if await btn.is_visible(timeout=2000):
-                    await btn.click()
-                    await asyncio.sleep(1)
-                    break
-            except Exception:
-                pass
-
-        login_input = page.locator("input[type='text'], input[name='login'], input[id*='login']").first
-        await login_input.wait_for(state="visible", timeout=10000)
-        await login_input.fill(EMIAS_LOGIN)
-
-        pass_input = page.locator("input[type='password']").first
-        await pass_input.fill(EMIAS_PASSWORD)
-
-        submit = page.locator("button[type='submit'], button:has-text('Войти')").first
-        await submit.click()
-
-        await page.wait_for_url("**/einfo/**", timeout=15000)
-        await asyncio.sleep(2)
-
-        # Сохраняем свежие cookies
-        cookies = await page.context.cookies()
-        save_cookies(cookies)
-        log.info("Автологин успешен")
-        return True
-    except Exception as e:
-        log.warning("Автологин не удался: %s", e)
+async def book_slot(session, slot: dict) -> bool:
+    """Записывается на первый доступный слот."""
+    times = slot.get("scheduleItems") or []
+    if not times:
         return False
-
-
-async def restore_session(context, page) -> bool:
-    """Пробует восстановить сессию из сохранённых cookies."""
-    cookies = load_cookies()
-    if not cookies:
-        return False
-    try:
-        await context.add_cookies(cookies)
-        await page.goto(EMIAS_URL, wait_until="networkidle", timeout=20000)
-        await asyncio.sleep(2)
-        # Проверяем что мы залогинены (нет редиректа на login)
-        if "login" in page.url or "auth" in page.url:
-            return False
-        # Проверяем наличие элементов личного кабинета
-        cabinet = page.locator("text=Направления, text=Записи, text=Новая запись").first
-        if await cabinet.is_visible(timeout=5000):
-            log.info("Сессия восстановлена из cookies")
-            return True
-    except Exception as e:
-        log.warning("Восстановление сессии не удалось: %s", e)
+    first = times[0]
+    payload = {
+        "referralId": REFERRAL_ID,
+        "lpuId": LPU_ID,
+        "ldpTypeId": LDP_TYPE_ID,
+        "omsNumber": OMS_NUMBER,
+        "birthDate": BIRTH_DATE,
+        "scheduleItemId": first.get("scheduleItemId"),
+        "appointmentDate": slot.get("date"),
+        "appointmentTime": first.get("time"),
+    }
+    endpoints = [
+        f"{API}/createLdpAppointment",
+        "https://emias.info/api-eip/v1/ldp/schedule/createLdpAppointment",
+    ]
+    for url in endpoints:
+        try:
+            async with session.post(
+                url, headers=emias_headers(), json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    log.info("Запись успешна")
+                    return True
+                body = await r.text()
+                log.error("%s → %d: %s", url.split("/")[-1], r.status, body[:200])
+        except Exception as e:
+            log.error("book_slot %s: %s", url.split("/")[-1], e)
     return False
 
 
-async def wait_for_manual_login(http_session, context) -> list | None:
-    """
-    Ждёт пока пользователь нажмёт 'Я вошёл' на странице авторизации.
-    После этого перехватывает cookies из Playwright context.
-    """
-    log.info("Жду подтверждения ручного логина...")
-    for _ in range(720):  # ждём максимум 1 час
-        await asyncio.sleep(5)
-        try:
-            async with http_session.get("http://localhost:8080/auth/status") as r:
-                data = await r.json()
-                if data.get("ready"):
-                    log.info("Пользователь подтвердил логин, перехватываю cookies...")
-                    # Открываем ЕМИАС в Playwright и забираем cookies
-                    tmp_page = await context.new_page()
-                    await tmp_page.goto("https://emias.info/app/einfo/", wait_until="networkidle", timeout=30000)
-                    await asyncio.sleep(2)
-                    cookies = await context.cookies()
-                    await tmp_page.close()
-                    if cookies:
-                        save_cookies(cookies)
-                        log.info("Перехвачено %d cookies", len(cookies))
-                        return cookies
-        except Exception as e:
-            log.warning("Ошибка при ожидании логина: %s", e)
-    return None
-
-
-# ── Проверка и запись ─────────────────────────────────────────────────────────
-async def check_and_book(page) -> str:
-    if "login" in page.url or "auth" in page.url:
-        return "need_relogin"
-
-    # Увеличенный таймаут + fallback с domcontentloaded
-    try:
-        await page.goto(EMIAS_URL, wait_until="networkidle", timeout=60000)
-    except PlaywrightTimeout:
-        log.warning("networkidle timeout, пробую domcontentloaded...")
-        try:
-            await page.goto(EMIAS_URL, wait_until="domcontentloaded", timeout=30000)
-        except PlaywrightTimeout:
-            log.error("Страница не загрузилась")
-            return "no_slots"
-    await asyncio.sleep(3)
-
-    # Логируем URL для диагностики
-    log.info("Текущий URL: %s", page.url)
-
-    # Проверяем авторизацию после загрузки
-    if "login" in page.url or "auth" in page.url:
-        return "need_relogin"
-
-    # Angular SPA — ждём пока фреймворк отрисует компоненты
-    # Ждём появления любого контента на странице
-    try:
-        await page.wait_for_selector("button, h1, h2, [class*='card'], [class*='referral'], [class*='direction']", timeout=15000)
-    except PlaywrightTimeout:
-        log.warning("Контент страницы не появился")
-
-    await asyncio.sleep(3)  # дополнительная пауза для Angular
-
-    # Ищем контейнер с нужной процедурой, затем кнопку внутри него
-    # ЕМИАС — Angular SPA, структура: карточка содержит заголовок + кнопку
-    PROCEDURE_TEXT = "Эзофагогастродуоденоскопия, колоноилеоскопия"
-
-    # Пробуем несколько XPath стратегий поиска кнопки внутри нужной карточки
-    xpath_variants = [
-        # Ищем предка кнопки «Записаться», который содержит название процедуры
-        f"//button[contains(text(),'Записаться') and ancestor::*[contains(.,'{PROCEDURE_TEXT}')]]",
-        # Ищем кнопку как следующий сиблинг или потомок блока с названием
-        f"//*[contains(text(),'{PROCEDURE_TEXT}')]/following::button[contains(text(),'Записаться')][1]",
-        f"//*[contains(.,'{PROCEDURE_TEXT}')]//button[contains(text(),'Записаться')]",
-    ]
-
-    book_btn = None
-    for xpath in xpath_variants:
-        try:
-            btn = page.locator(f"xpath={xpath}").first
-            await btn.wait_for(state="visible", timeout=5000)
-            book_btn = btn
-            log.info("Кнопка найдена по xpath: %s", xpath[:60])
-            break
-        except PlaywrightTimeout:
-            continue
-
-    if book_btn is None:
-        page_text = await page.inner_text("body")
-        log.warning("Кнопка для нужной процедуры не найдена. Страница (500 симв.): %s", page_text[:500])
-        return "no_slots"
-
-    await book_btn.click()
-    log.info("Нажал 'Записаться' для Эзофагогастродуоденоскопии")
-
-    await asyncio.sleep(3)
-
-    # Нет талонов?
-    no_slots = page.locator("text=нет времени для самостоятельной записи, text=Нет доступных талонов, text=Попробуйте позже").first
-    if await no_slots.is_visible(timeout=4000):
-        return "no_slots"
-
-    log.info("🎉 Талоны появились! Выбираю слот...")
-
-    # Выбираем первый доступный слот
-    slot = page.locator(
-        "button.slot, .time-slot:not(.disabled), [class*='slot']:not([class*='disabled']), "
-        "td.available, .calendar-day:not(.disabled)"
-    ).first
-    try:
-        await slot.wait_for(state="visible", timeout=8000)
-        await slot.click()
-        await asyncio.sleep(2)
-    except PlaywrightTimeout:
-        log.warning("Слоты не найдены")
-        return "no_slots"
-
-    # Подтверждаем запись
-    confirm = page.locator(
-        "button:has-text('Подтвердить'), button:has-text('Записаться'), button:has-text('Готово'), button[type='submit']"
-    ).last
-    try:
-        await confirm.wait_for(state="visible", timeout=8000)
-        await confirm.click()
-        await asyncio.sleep(3)
-    except PlaywrightTimeout:
-        pass
-
-    # Проверяем успех
-    success = page.locator("text=Вы записаны, text=Запись подтверждена, text=Успешно").first
-    if await success.is_visible(timeout=5000):
-        return "booked"
-    if any(x in page.url for x in ["success", "confirm", "appointment"]):
-        return "booked"
-
-    return "no_slots"
-
-
-# ── Главный цикл ──────────────────────────────────────────────────────────────
 async def run():
-    import aiohttp
-    async with aiohttp.ClientSession() as http:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+    async with aiohttp.ClientSession() as session:
+
+        # Проверка авторизации при старте
+        log.info("Проверяю авторизацию...")
+        test = await get_slots(session)
+        if test == "unauthorized":
+            await tg(session,
+                "❌ <b>Ошибка авторизации</b>\n\n"
+                "Проверьте <code>EI_TOKEN</code> и <code>EMIAS_COOKIE</code> в Timeweb.\n"
+                "Возьмите свежие значения: F12 → Network → запрос к emias.info → Headers."
             )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-                locale="ru-RU",
-            )
-            page = await context.new_page()
+            return
 
-            # ── Авторизация при старте ────────────────────────────────────────
-            log.info("Попытка восстановить сессию из cookies...")
-            logged_in = await restore_session(context, page)
+        log.info("Авторизация OK")
+        await tg(session,
+            "🤖 <b>Бот запущен и авторизован</b>\n\n"
+            "Мониторю: Эзофагогастродуоденоскопия, колоноилеоскопия (скрининг)\n"
+            "🏥 МНЦ ГКБ им. С.П. Боткина\n\n"
+            f"🔴 Активный режим 07:25–07:45 МСК — каждые {CHECK_ACTIVE} сек\n"
+            f"🟢 Обычный режим — каждые {CHECK_NORMAL // 60} мин"
+        )
 
-            if not logged_in:
-                log.info("Cookies устарели, пробую автологин...")
-                logged_in = await try_login_with_password(page)
+        last_mode = None
 
-            if not logged_in:
-                log.warning("Автологин не удался, запрашиваю ручной логин...")
-                await tg(http, "🤖 Бот запущен, но требуется авторизация.")
-                await tg_auth_request(http)
-                new_cookies = await wait_for_manual_login(http, context)
-                if new_cookies:
-                    save_cookies(new_cookies)
-                    await context.add_cookies(new_cookies)
-                    logged_in = True
-                else:
-                    await tg(http, "❌ Авторизация не получена за 1 час. Перезапустите бота.")
-                    return
+        while True:
+            try:
+                interval = get_interval()
+                mode = "active" if interval == CHECK_ACTIVE else "normal"
+                msk_now = datetime.now(MSK).strftime("%H:%M")
 
-            # Отправляем cookies в Telegram для сохранения в EMIAS_COOKIES
-            saved = load_cookies()
-            if saved and not COOKIES_ENV:
-                cookies_str = json.dumps(saved)
-                await tg(http,
-                    "🤖 <b>Бот запущен и авторизован</b>\n\n"
-                    f"🔴 Активный режим 07:25–07:45 МСК — каждые {CHECK_INTERVAL_ACTIVE} сек\n"
-                    f"🟢 Обычный режим — каждые {CHECK_INTERVAL_NORMAL // 60} мин\n\n"
-                    "💾 <b>Сохраните cookies</b> — добавьте переменную <code>EMIAS_COOKIES</code> в Timeweb:"
-                )
-                await tg(http, f"<code>{cookies_str}</code>")
-            else:
-                await tg(http, (
-                    "🤖 <b>Бот запущен и авторизован</b>\n\n"
-                    f"🔴 Активный режим 07:25–07:45 МСК — каждые {CHECK_INTERVAL_ACTIVE} сек\n"
-                    f"🟢 Обычный режим — каждые {CHECK_INTERVAL_NORMAL // 60} мин"
-                ))
+                if mode != last_mode:
+                    if mode == "active":
+                        await tg(session, f"🔴 <b>Активный режим</b> [{msk_now} МСК] — каждые {interval} сек")
+                    else:
+                        await tg(session, f"🟢 Обычный режим [{msk_now} МСК] — каждые {interval // 60} мин")
+                    last_mode = mode
 
-            last_mode = None
+                slots = await get_slots(session)
 
-            while True:
-                try:
-                    interval = get_interval()
-                    mode = "active" if interval == CHECK_INTERVAL_ACTIVE else "normal"
+                if slots == "unauthorized":
+                    await tg(session,
+                        "🔐 <b>Токен истёк — нужно обновить</b>\n\n"
+                        "1. Зайдите в ЕМИАС в браузере\n"
+                        "2. F12 → Network → любой запрос к emias.info\n"
+                        "3. Скопируйте <code>Ei-Token</code> и <code>Cookie</code>\n"
+                        "4. Обновите в Timeweb → Variables\n"
+                        "5. Перезапустите приложение"
+                    )
+                    await asyncio.sleep(1800)
+                    continue
 
-                    if mode != last_mode:
-                        msk = datetime.now(MSK).strftime("%H:%M")
-                        if mode == "active":
-                            await tg(http, f"🔴 <b>Активный режим</b> [{msk} МСК]\nПроверяю каждые {interval} сек")
-                        else:
-                            await tg(http, f"🟢 Обычный режим [{msk} МСК] — каждые {interval // 60} мин")
-                        last_mode = mode
+                if slots:
+                    first = slots[0]
+                    date = first.get("date", "?")
+                    times = first.get("scheduleItems", [])
+                    time = times[0].get("time", "?") if times else "?"
+                    log.info("Талоны найдены! %s %s", date, time)
+                    await tg(session, f"🎉 <b>Талоны появились!</b> Записываюсь на {date} в {time}...")
 
-                    result = await check_and_book(page)
-
-                    if result == "booked":
-                        msk_time = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
-                        await tg(http,
+                    if await book_slot(session, first):
+                        await tg(session,
                             f"✅ <b>Записано!</b>\n\n"
-                            f"Талон на Эзофагогастродуоденоскопию, колоноилеоскопию (скрининг) занят.\n"
-                            f"⏰ Время записи: {msk_time} МСК"
+                            f"📋 Эзофагогастродуоденоскопия, колоноилеоскопия (скрининг)\n"
+                            f"📅 {date} в {time}\n"
+                            f"🏥 МНЦ ГКБ им. С.П. Боткина"
                         )
-                        log.info("Запись успешна! Останавливаю бота.")
                         break
+                    else:
+                        await tg(session, "⚠️ Не удалось записаться, попробую снова через минуту...")
+                        await asyncio.sleep(60)
+                        continue
+                else:
+                    log.info("[%s] Талонов нет", datetime.now(MSK).strftime("%H:%M:%S"))
 
-                    elif result == "need_relogin":
-                        log.warning("Сессия истекла")
-                        # Пробуем автологин
-                        if await try_login_with_password(page):
-                            await tg(http, "🔄 Сессия обновлена автоматически")
-                        else:
-                            # Просим пользователя залогиниться
-                            await tg_auth_request(http)
-                            new_cookies = await wait_for_manual_login(http, context)
-                            if new_cookies:
-                                save_cookies(new_cookies)
-                                await context.add_cookies(new_cookies)
-                                await tg(http, "✅ Авторизация обновлена, продолжаю мониторинг")
-                            else:
-                                await tg(http, "❌ Авторизация не получена. Проверьте бота.")
+            except Exception as e:
+                log.error("Ошибка: %s", e)
+                await tg(session, f"⚠️ Ошибка: {e}")
 
-                    elif result == "no_slots":
-                        log.info("[%s] Талонов нет", datetime.now(MSK).strftime("%H:%M:%S"))
+            await asyncio.sleep(get_interval())
 
-                except Exception as e:
-                    log.error("Ошибка: %s", e)
-                    await tg(http, f"⚠️ Ошибка: {e}")
 
-                await asyncio.sleep(get_interval())
-
-            await browser.close()
+if __name__ == "__main__":
+    asyncio.run(run())
