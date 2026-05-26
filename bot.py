@@ -1,34 +1,34 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
 import aiohttp
 
 # ── Настройки ─────────────────────────────────────────────────────────────────
-OMS_NUMBER    = os.environ["OMS_NUMBER"]
-BIRTH_DATE    = os.environ["BIRTH_DATE"]
-TG_TOKEN      = os.environ["TG_TOKEN"]
-TG_CHAT_ID    = os.environ["TG_CHAT_ID"]
-REFERRAL_ID   = int(os.getenv("REFERRAL_ID", "172751854717"))
+OMS_NUMBER     = os.environ["OMS_NUMBER"]    # 7700007070150870
+BIRTH_DATE     = os.environ["BIRTH_DATE"]   # 1970-08-15
+EMIAS_LOGIN    = os.environ["EMIAS_LOGIN"]  # логин ЕМИАС
+EMIAS_PASSWORD = os.environ["EMIAS_PASSWORD"]  # пароль ЕМИАС
+TG_TOKEN       = os.environ["TG_TOKEN"]
+TG_CHAT_ID     = os.environ["TG_CHAT_ID"]
+REFERRAL_ID    = int(os.getenv("REFERRAL_ID", "172751854717"))
 
-CHECK_NORMAL  = int(os.getenv("CHECK_INTERVAL_NORMAL", "300"))  # 5 мин
-CHECK_ACTIVE  = int(os.getenv("CHECK_INTERVAL_ACTIVE", "1"))    # 1 сек
-ACTIVE_START  = (7, 28)
-ACTIVE_END    = (7, 35)
-
-# Токены — читаем при старте, храним в словаре для обновления
-_tokens = {
-    "ei_token":     os.environ["EI_TOKEN"],
-    "cookie":       os.environ["EMIAS_COOKIE"],
-    "access_token": os.environ["ACCESS_TOKEN"],
-}
+CHECK_NORMAL   = int(os.getenv("CHECK_INTERVAL_NORMAL", "300"))  # 5 мин
+CHECK_ACTIVE   = int(os.getenv("CHECK_INTERVAL_ACTIVE", "1"))    # 1 сек
+ACTIVE_START   = (7, 28)
+ACTIVE_END     = (7, 35)
+LOGIN_INTERVAL = 2.5 * 60 * 60  # обновляем куку каждые 2.5 часа
 
 MSK = timezone(timedelta(hours=3))
 API = "https://emias.info/api-eip/v4/saOrchestrator"
 TG_MIRRORS = ["https://api.telegram.org", "https://tg.i-c-a.su"]
 
-# Интервал обновления сессии — каждые 20 минут (с запасом)
-SESSION_REFRESH_INTERVAL = 20 * 60
+# Токены — обновляются при каждом автологине
+_tokens = {
+    "ei_token": "",
+    "cookie":   "",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,74 +79,123 @@ async def tg(session, text: str):
     log.error("Telegram недоступен")
 
 
-# ── Обновление сессии ─────────────────────────────────────────────────────────
-async def refresh_session(session) -> bool:
+# ── Автологин через Playwright ────────────────────────────────────────────────
+async def do_login() -> bool:
     """
-    Обновляет сессию через whoAmI.
-    accessToken == Ei-Token — одно и то же значение.
-    whoAmI возвращает новый accessToken который используем как новый Ei-Token.
+    Открывает браузер, логинится в ЕМИАС, забирает session-cookie и Ei-Token.
+    Браузер закрывается сразу после получения токенов.
     """
-    import re
-    log.info("Обновляю сессию через whoAmI (accessToken=%s...)", _tokens["access_token"][:20])
+    from playwright.async_api import async_playwright, TimeoutError as PwTimeout
+    log.info("Запускаю браузер для обновления сессии...")
+
     try:
-        async with session.post(
-            "https://emias.info/web-api/whoAmI/",
-            json={"accessToken": _tokens["access_token"]},
-            headers={
-                "Content-Type": "application/json",
-                "Cookie":       _tokens["cookie"],
-                "Origin":       "https://emias.info",
-                "Referer":      "https://emias.info/app/einfo/",
-                "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-            },
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as r:
-            if r.status == 200:
-                # Обновляем session-cookie
-                new_cookies = r.cookies
-                if new_cookies:
-                    existing = _tokens["cookie"]
-                    for k, v in new_cookies.items():
-                        part = f"{k}={v.value}"
-                        if k in existing:
-                            existing = re.sub(rf"{k}=[^;]*", part, existing)
-                        else:
-                            existing = part + "; " + existing
-                    _tokens["cookie"] = existing
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+                locale="ru-RU",
+            )
+            page = await context.new_page()
 
-                # Самое важное: whoAmI возвращает новый accessToken
-                # который одновременно является новым Ei-Token
-                data = await r.json()
-                new_token = (
-                    data.get("accessToken") or
-                    data.get("access_token") or
-                    data.get("eiToken") or
-                    data.get("token")
-                )
-                if new_token:
-                    _tokens["access_token"] = new_token
-                    _tokens["ei_token"] = new_token
-                    log.info("Токен обновлён: %s...", new_token[:20])
-                else:
-                    log.info("whoAmI не вернул новый токен, используем текущий")
+            # Перехватываем все запросы чтобы поймать Ei-Token
+            ei_token_found = []
 
-                log.info("whoAmI OK — сессия обновлена")
-                return True
+            async def on_request(request):
+                ei = request.headers.get("ei-token") or request.headers.get("Ei-Token")
+                if ei and ei not in ei_token_found:
+                    ei_token_found.append(ei)
 
-            body = await r.text()
-            log.warning("whoAmI → %d: %s", r.status, body[:200])
-            return False
+            page.on("request", on_request)
+
+            # Открываем ЕМИАС
+            await page.goto("https://emias.info/app/einfo/", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+
+            # Ищем кнопку входа
+            for selector in ["text=Войти", "a:has-text('Войти')", "button:has-text('Войти')"]:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        await asyncio.sleep(1)
+                        break
+                except Exception:
+                    pass
+
+            # Переключаемся на логин/пароль если нужно
+            for selector in ["text=Войти с логином и паролем", "text=Логин и пароль", "text=Другой способ"]:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        await asyncio.sleep(1)
+                        break
+                except Exception:
+                    pass
+
+            # Вводим логин
+            login_input = page.locator("input[type='text'], input[name='login'], input[id*='login']").first
+            await login_input.wait_for(state="visible", timeout=15000)
+            await login_input.fill(EMIAS_LOGIN)
+
+            # Вводим пароль
+            pass_input = page.locator("input[type='password']").first
+            await pass_input.fill(EMIAS_PASSWORD)
+
+            # Нажимаем войти
+            submit = page.locator("button[type='submit'], button:has-text('Войти')").first
+            await submit.click()
+
+            # Ждём загрузки личного кабинета
+            try:
+                await page.wait_for_url("**/einfo/**", timeout=20000)
+            except PwTimeout:
+                log.error("Логин не прошёл — не попали в личный кабинет")
+                await browser.close()
+                return False
+
+            await asyncio.sleep(3)
+
+            # Ждём пока появится Ei-Token в запросах
+            for _ in range(10):
+                if ei_token_found:
+                    break
+                await asyncio.sleep(1)
+
+            # Собираем cookies
+            cookies = await context.cookies()
+            cookie_str = "; ".join(
+                f"{c['name']}={c['value']}"
+                for c in cookies
+                if "emias.info" in c.get("domain", "")
+            )
+
+            await browser.close()
+
+            if not cookie_str:
+                log.error("Cookies не получены после логина")
+                return False
+
+            _tokens["cookie"] = cookie_str
+            if ei_token_found:
+                _tokens["ei_token"] = ei_token_found[-1]
+                log.info("Ei-Token получен: %s...", ei_token_found[-1][:20])
+            else:
+                log.warning("Ei-Token не перехвачен, используем cookie")
+
+            log.info("Логин успешен, cookie обновлены")
+            return True
+
     except Exception as e:
-        log.error("whoAmI ошибка: %s", e)
+        log.error("Ошибка логина: %s", e)
         return False
 
 
 # ── Проверка талонов ──────────────────────────────────────────────────────────
 async def check_available(session):
-    """
-    Возвращает dict с данными направления если талоны есть,
-    [] если талонов нет, 'unauthorized' если токен истёк.
-    """
     try:
         async with session.post(
             f"{API}/getAssignmentsReferralsInfo",
@@ -189,9 +238,9 @@ async def get_slots(session, referral: dict) -> list:
             f"{API}/getAvailableResourceScheduleInfo",
             headers=emias_headers(),
             json={
-                "omsNumber":         OMS_NUMBER,
-                "birthDate":         BIRTH_DATE,
-                "referralId":        REFERRAL_ID,
+                "omsNumber":           OMS_NUMBER,
+                "birthDate":           BIRTH_DATE,
+                "referralId":          REFERRAL_ID,
                 "availableResourceId": referral.get("availableResourceId"),
                 "complexResourceId":   referral.get("complexResourceId"),
             },
@@ -261,17 +310,19 @@ async def book_slot(session, referral: dict, slot: dict) -> bool:
 async def run():
     async with aiohttp.ClientSession() as session:
 
-        # Проверка авторизации при старте
-        log.info("Проверяю авторизацию...")
+        # Первый логин при старте
+        log.info("Первый логин...")
+        if not await do_login():
+            await tg(session,
+                "❌ <b>Не удалось залогиниться при запуске</b>\n\n"
+                "Проверьте <code>EMIAS_LOGIN</code> и <code>EMIAS_PASSWORD</code> в Timeweb."
+            )
+            return
+
+        # Проверяем что API работает
         test = await check_available(session)
         if test == "unauthorized":
-            await tg(session,
-                "❌ <b>Ошибка авторизации при запуске</b>\n\n"
-                "Обновите токены в Timeweb:\n"
-                "<code>EI_TOKEN</code>, <code>EMIAS_COOKIE</code>, <code>ACCESS_TOKEN</code>\n\n"
-                "F12 → Network → Headers (для EI_TOKEN и COOKIE)\n"
-                "F12 → Application → Local Storage → persist:sessionAuth (для ACCESS_TOKEN)"
-            )
+            await tg(session, "❌ <b>Авторизация не прошла после логина</b>")
             return
 
         log.info("Авторизация OK")
@@ -281,17 +332,17 @@ async def run():
             "🏥 МНЦ ГКБ им. С.П. Боткина\n\n"
             f"🔴 Активный режим 07:28–07:35 МСК — каждую секунду\n"
             f"🟢 Обычный режим — каждые {CHECK_NORMAL // 60} мин\n"
-            f"🔄 Автообновление сессии — каждые {SESSION_REFRESH_INTERVAL // 60} мин"
+            f"🔄 Автообновление сессии — каждые 2.5 часа"
         )
 
-        last_mode = None
-        last_refresh = datetime.now(MSK)
+        last_mode    = None
+        last_login   = datetime.now(MSK)
 
         while True:
             try:
-                now = datetime.now(MSK)
+                now      = datetime.now(MSK)
                 interval = get_interval()
-                mode = "active" if interval == CHECK_ACTIVE else "normal"
+                mode     = "active" if interval == CHECK_ACTIVE else "normal"
 
                 # Уведомляем о смене режима
                 if mode != last_mode:
@@ -302,33 +353,29 @@ async def run():
                         await tg(session, f"🟢 Обычный режим [{msk_now} МСК] — каждые {interval // 60} мин")
                     last_mode = mode
 
-                # Проактивное обновление сессии каждые 20 минут
-                if (now - last_refresh).total_seconds() > SESSION_REFRESH_INTERVAL:
-                    log.info("Проактивное обновление сессии...")
-                    await refresh_session(session)
-                    last_refresh = now
+                # Обновляем сессию каждые 2.5 часа
+                if (now - last_login).total_seconds() > LOGIN_INTERVAL:
+                    log.info("Обновляю сессию через логин...")
+                    if await do_login():
+                        last_login = datetime.now(MSK)
+                        log.info("Сессия обновлена успешно")
+                    else:
+                        log.error("Не удалось обновить сессию, продолжаю со старой")
 
                 # Проверяем талоны
                 result = await check_available(session)
 
                 if result == "unauthorized":
-                    # Пробуем обновить через whoAmI
-                    log.warning("401 — пробую обновить сессию...")
-                    if await refresh_session(session):
-                        log.info("Сессия обновлена, повторяю проверку")
+                    log.warning("401 — принудительно обновляю сессию...")
+                    if await do_login():
+                        last_login = datetime.now(MSK)
                         await tg(session, "🔄 Сессия обновлена автоматически")
-                        last_refresh = datetime.now(MSK)
                     else:
-                        # Только тогда просим пользователя
                         await tg(session,
-                            "🔐 <b>Требуется обновление токенов</b>\n\n"
-                            "1. Откройте emias.info в браузере\n"
-                            "2. F12 → Network → Headers → скопируйте <code>Ei-Token</code> и <code>Cookie</code>\n"
-                            "3. F12 → Application → Local Storage → <code>persist:sessionAuth</code> → скопируйте <code>accessToken</code>\n"
-                            "4. Обновите в Timeweb: <code>EI_TOKEN</code>, <code>EMIAS_COOKIE</code>, <code>ACCESS_TOKEN</code>\n"
-                            "5. Перезапустите приложение"
+                            "❌ <b>Не удалось обновить сессию</b>\n\n"
+                            "Проверьте <code>EMIAS_LOGIN</code> и <code>EMIAS_PASSWORD</code> в Timeweb."
                         )
-                        await asyncio.sleep(1800)
+                        await asyncio.sleep(300)
                     continue
 
                 if result and isinstance(result, dict):
