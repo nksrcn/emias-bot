@@ -157,7 +157,7 @@ def create_app():
     return app
 
 
-async def start_server(port: int = 8080):
+async def start_server(port: int = int(os.getenv("PORT", "8080"))):
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
