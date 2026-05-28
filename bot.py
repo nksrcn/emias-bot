@@ -136,18 +136,33 @@ async def do_login() -> bool:
                 except Exception:
                     pass
 
-            # Вводим логин
-            login_input = page.locator("input[type='text'], input[name='login'], input[id*='login']").first
+            # Открываем страницу логина напрямую
+            LOGIN_URL = (
+                "https://login.mos.ru/sps/login/methods/password"
+                "?bo=%2Fsps%2Foauth%2Fae%3Fscope%3Dopenid%2Bprofile"
+                "%26client_id%3Demias.info.web"
+                "%26redirect_uri%3Dhttps%253A%252F%252Femias.info%252Fsudir-web"
+                "%26response_type%3Dcode%26access_type%3Doffline%26prompt%3Dlogin"
+            )
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+            log.info("Страница логина: %s", page.url)
+
+            # Вводим логин — точные селекторы с login.mos.ru
+            login_input = page.locator("input#login").first
             await login_input.wait_for(state="visible", timeout=15000)
             await login_input.fill(EMIAS_LOGIN)
+            log.info("Логин введён")
 
             # Вводим пароль
             pass_input = page.locator("input[type='password']").first
+            await pass_input.wait_for(state="visible", timeout=10000)
             await pass_input.fill(EMIAS_PASSWORD)
+            log.info("Пароль введён")
 
-            # Нажимаем войти
-            submit = page.locator("button[type='submit'], button:has-text('Войти')").first
-            await submit.click()
+            # Нажимаем Войти
+            await page.locator("button[type='submit']").first.click()
+            log.info("Нажал Войти")
 
             # Ждём загрузки личного кабинета
             try:
