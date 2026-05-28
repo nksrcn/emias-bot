@@ -160,9 +160,31 @@ async def do_login() -> bool:
             await pass_input.fill(EMIAS_PASSWORD)
             log.info("Пароль введён")
 
-            # Нажимаем Войти
-            await page.locator("button[type='submit']").first.click()
-            log.info("Нажал Войти")
+            # Нажимаем Войти — пробуем несколько способов
+            await asyncio.sleep(1)
+            clicked = False
+            for sel in [
+                "button[type='submit']",
+                "button.btn-primary",
+                "button:has-text('Войти')",
+                "input[type='submit']",
+                "#loginButton",
+                "button",
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=3000):
+                        await el.click()
+                        clicked = True
+                        log.info("Нажал Войти через: %s", sel)
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
+                # Последний вариант — Enter в поле пароля
+                await pass_input.press("Enter")
+                log.info("Нажал Enter в поле пароля")
 
             # Ждём загрузки личного кабинета
             try:
